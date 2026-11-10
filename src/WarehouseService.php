@@ -98,24 +98,54 @@ final class WarehouseService
         }
     }
 
-    public function listStocks(array $filters): array
-    {
-        $sql = 'SELECT s.warehouse_id, w.code AS warehouse_code, w.name AS warehouse_name,
-                       s.product_id, s.quantity, s.reserved, s.min_stock,
-                       (s.quantity - s.reserved) AS available, s.updated_at
-                FROM warehouse_stocks s JOIN warehouses w ON w.id = s.warehouse_id WHERE 1 = 1';
-        $values = [];
-        foreach (['warehouse_id', 'product_id'] as $field) {
-            if (isset($filters[$field]) && $filters[$field] !== '') {
-                $sql .= " AND s.{$field} = ?";
-                $values[] = $filters[$field];
-            }
-        }
-        $sql .= ' ORDER BY w.name, s.product_id';
-        $statement = $this->db->prepare($sql);
-        $statement->execute($values);
-        return $statement->fetchAll();
+public function listStocks(array $filters): array
+{
+    $sql = 'SELECT s.warehouse_id, w.code AS warehouse_code, w.name AS warehouse_name,
+                   s.product_id, s.quantity, s.reserved, s.min_stock,
+                   (s.quantity - s.reserved) AS available, s.updated_at
+            FROM warehouse_stocks s
+            JOIN warehouses w ON w.id = s.warehouse_id
+            WHERE 1 = 1';
+
+    $values = [];
+
+    if (!empty($filters['warehouse_id'])) {
+        $sql .= ' AND s.warehouse_id = ?';
+        $values[] = $filters['warehouse_id'];
     }
+
+    if (!empty($filters['product_id'])) {
+        $sql .= ' AND s.product_id LIKE ?';
+        $values[] = '%' . trim($filters['product_id']) . '%';
+    }
+
+    if (isset($filters['low_stock']) && $filters['low_stock'] === 'true') {
+        $sql .= ' AND s.quantity - s.reserved <= s.min_stock';
+    }
+
+    $allowedSort = [
+        'quantity' => 's.quantity',
+        'available' => '(s.quantity - s.reserved)',
+        'updated_at' => 's.updated_at',
+        'product_id' => 's.product_id',
+    ];
+
+    $sort = $filters['sort'] ?? 'product_id';
+    $order = strtoupper($filters['order'] ?? 'ASC');
+
+    $sortColumn = $allowedSort[$sort] ?? 's.product_id';
+
+    if (!in_array($order, ['ASC', 'DESC'], true)) {
+        $order = 'ASC';
+    }
+
+    $sql .= " ORDER BY {$sortColumn} {$order}";
+
+    $statement = $this->db->prepare($sql);
+    $statement->execute($values);
+
+    return $statement->fetchAll();
+}
 
     public function adjustStock(array $input): array
     {
