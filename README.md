@@ -9,6 +9,12 @@ Warehouse inventory, retail restock fulfillment, supplier purchasing, and goods 
 3. Configure Apache to allow `.htaccess` overrides and enable `mod_rewrite`. Alternatively, call `index.php` directly with the corresponding route path.
 4. Ensure the PHP `pdo_mysql` extension is enabled. Keep the project directory out of public deployments if you do not need direct HTTP access to it; source/config directories are denied by their `.htaccess` files.
 
+## Dashboard
+
+Open the project root in a browser to use the warehouse dashboard. It provides screens for warehouse management, stock and adjustments, restock orders, supplier purchase requests, goods receipts, and stock movement history.
+
+Enter the `WAREHOUSE_MANAGER_TOKEN` and `OWNER_TOKEN` from `.env.example` in the dashboard's API access panel. Manager actions use the warehouse manager token; warehouse master actions use the owner token. Tokens stay in the current browser tab's session storage and are not sent to any service other than this project's API. The dashboard does not expose the internal event-consumer endpoint.
+
 All API responses are JSON. Send `Authorization: Bearer <token>`:
 
 | Token | Access |

@@ -26,40 +26,44 @@ final class EventService
             throw new ApiException(422, 'Unsupported event_type');
         }
 
-        for ($attempt = 1; ; $attempt++) {
-            try {
-                $this->db->beginTransaction();
-                $insert = $this->db->prepare(
-                    'INSERT INTO processed_events (event_id, event_type) VALUES (?, ?)'
-                );
-                try {
-                    $insert->execute([$eventId, $eventType]);
-                } catch (PDOException $exception) {
-                    if ($this->isDuplicateKey($exception)) {
-                        $this->db->rollBack();
-                        return ['duplicate' => true, 'event_id' => $eventId];
-                    }
-                    throw $exception;
-                }
+        return $this->consumeWithRetry($eventId, $eventType, $payload, 1);
+    }
 
-                match ($eventType) {
-                    'restock.requested' => $this->restockRequested($payload),
-                    'shipment.shipped' => $this->shipmentShipped($payload),
-                    'po.confirmed' => $this->purchaseOrderStatus($payload, 'CONFIRMED'),
-                    'po.shipped' => $this->purchaseOrderStatus($payload, 'SHIPPED'),
-                    'po.delivered' => $this->purchaseOrderStatus($payload, 'DELIVERED'),
-                };
-                $this->db->commit();
-                return ['duplicate' => false, 'event_id' => $eventId];
-            } catch (Throwable $exception) {
-                if ($this->db->inTransaction()) {
+    private function consumeWithRetry(string $eventId, string $eventType, array $payload, int $attempt): array
+    {
+        try {
+            $this->db->beginTransaction();
+            $insert = $this->db->prepare(
+                'INSERT INTO processed_events (event_id, event_type) VALUES (?, ?)'
+            );
+            try {
+                $insert->execute([$eventId, $eventType]);
+            } catch (PDOException $exception) {
+                if ($this->isDuplicateKey($exception)) {
                     $this->db->rollBack();
+                    return ['duplicate' => true, 'event_id' => $eventId];
                 }
-                if ($attempt >= 3 || !$this->isRetryableTransactionError($exception)) {
-                    throw $exception;
-                }
-                usleep(random_int(10000, 30000) * $attempt);
+                throw $exception;
             }
+
+            match ($eventType) {
+                'restock.requested' => $this->restockRequested($payload),
+                'shipment.shipped' => $this->shipmentShipped($payload),
+                'po.confirmed' => $this->purchaseOrderStatus($payload, 'CONFIRMED'),
+                'po.shipped' => $this->purchaseOrderStatus($payload, 'SHIPPED'),
+                'po.delivered' => $this->purchaseOrderStatus($payload, 'DELIVERED'),
+            };
+            $this->db->commit();
+            return ['duplicate' => false, 'event_id' => $eventId];
+        } catch (Throwable $exception) {
+            if ($this->db->inTransaction()) {
+                $this->db->rollBack();
+            }
+            if ($attempt >= 3 || !$this->isRetryableTransactionError($exception)) {
+                throw $exception;
+            }
+            usleep(random_int(10000, 30000) * $attempt);
+            return $this->consumeWithRetry($eventId, $eventType, $payload, $attempt + 1);
         }
     }
 
@@ -84,14 +88,11 @@ final class EventService
             throw $exception;
         }
 
+        $this->insertRestockItems($orderId, $items);
+
         $allAvailable = true;
         $shortages = [];
         foreach ($items as $item) {
-            $statement = $this->db->prepare(
-                'INSERT INTO warehouse_restock_order_items (restock_order_id, product_id, quantity)
-                 VALUES (?, ?, ?)'
-            );
-            $statement->execute([$orderId, $item['product_id'], $item['quantity']]);
             $stock = $this->lockStock($warehouseId, $item['product_id']);
             $available = (int) $stock['quantity'] - (int) $stock['reserved'];
             if ($available < $item['quantity']) {
@@ -136,79 +137,139 @@ final class EventService
 
     private function shipmentShipped(array $payload): void
     {
-        $orderId = $this->string($payload, 'restock_order_id', 'order_id');
-        $statement = $this->db->prepare(
-            'SELECT * FROM warehouse_restock_orders WHERE id = ? FOR UPDATE'
-        );
-        $statement->execute([$orderId]);
-        $order = $statement->fetch();
-        if (!$order) {
-            throw new ApiException(404, 'Restock order not found');
+        $ownsTransaction = !$this->db->inTransaction();
+        if ($ownsTransaction) {
+            $this->db->beginTransaction();
         }
-        if ($order['status'] !== 'RESERVED') {
-            throw new ApiException(409, 'Restock order is not reserved for shipment');
-        }
-        $itemsStatement = $this->db->prepare(
-            'SELECT * FROM warehouse_restock_order_items WHERE restock_order_id = ? ORDER BY product_id'
-        );
-        $itemsStatement->execute([$orderId]);
-        foreach ($itemsStatement->fetchAll() as $item) {
-            $stock = $this->lockStock($order['warehouse_id'], $item['product_id']);
-            $quantity = (int) $item['quantity'];
-            $reserved = (int) $stock['reserved'] - $quantity;
-            $onHand = (int) $stock['quantity'] - $quantity;
-            if ($reserved < 0 || $onHand < $reserved) {
-                throw new ApiException(409, 'Reserved stock is inconsistent for this shipment');
+
+        try {
+            $orderId = $this->string($payload, 'restock_order_id', 'order_id');
+            $statement = $this->db->prepare(
+                'SELECT id, warehouse_id, status
+                 FROM warehouse_restock_orders
+                 WHERE id = ?
+                 FOR UPDATE'
+            );
+            $statement->execute([$orderId]);
+            $order = $statement->fetch();
+            if (!$order) {
+                throw new ApiException(404, 'Restock order not found');
             }
-            $update = $this->db->prepare(
-                'UPDATE warehouse_stocks SET quantity = ?, reserved = ?
-                 WHERE warehouse_id = ? AND product_id = ?'
+            if ($order['status'] !== 'RESERVED') {
+                throw new ApiException(409, 'Restock order is not reserved for shipment');
+            }
+            $itemsStatement = $this->db->prepare(
+                'SELECT restock_order_id, product_id, quantity
+                 FROM warehouse_restock_order_items
+                 WHERE restock_order_id = ?
+                 ORDER BY product_id'
             );
-            $update->execute([$onHand, $reserved, $order['warehouse_id'], $item['product_id']]);
-            $this->movement(
-                $order['warehouse_id'], $item['product_id'], 'OUT', $quantity, $orderId,
-                (int) $stock['quantity'], $onHand, (int) $stock['reserved'], (int) $stock['reserved']
-            );
-            $this->movement(
-                $order['warehouse_id'], $item['product_id'], 'RELEASE', $quantity, $orderId,
-                $onHand, $onHand, (int) $stock['reserved'], $reserved
-            );
+            $itemsStatement->execute([$orderId]);
+            $stockUpdates = [];
+            foreach ($itemsStatement->fetchAll() as $item) {
+                $stock = $this->lockStock($order['warehouse_id'], $item['product_id']);
+                $quantity = (int) $item['quantity'];
+                $reserved = (int) $stock['reserved'] - $quantity;
+                $onHand = (int) $stock['quantity'] - $quantity;
+                if ($reserved < 0 || $onHand < 0 || $reserved > $onHand) {
+                    throw new ApiException(409, 'Reserved stock is inconsistent for this shipment');
+                }
+                $stockUpdates[] = [
+                    'product_id' => $item['product_id'],
+                    'quantity' => $onHand,
+                    'reserved' => $reserved,
+                    'quantity_before' => (int) $stock['quantity'],
+                    'reserved_before' => (int) $stock['reserved'],
+                ];
+            }
+
+            $this->updateShipmentStock($order['warehouse_id'], $stockUpdates);
+
+            foreach ($stockUpdates as $stockUpdate) {
+                $this->movement(
+                    $order['warehouse_id'], $stockUpdate['product_id'], 'OUT',
+                    (int) $stockUpdate['quantity_before'] - $stockUpdate['quantity'],
+                    $orderId,
+                    $stockUpdate['quantity_before'], $stockUpdate['quantity'],
+                    $stockUpdate['reserved_before'], $stockUpdate['reserved_before']
+                );
+                $this->movement(
+                    $order['warehouse_id'], $stockUpdate['product_id'], 'RELEASE',
+                    $stockUpdate['reserved_before'] - $stockUpdate['reserved'],
+                    $orderId,
+                    $stockUpdate['quantity'], $stockUpdate['quantity'],
+                    $stockUpdate['reserved_before'], $stockUpdate['reserved']
+                );
+            }
+            $this->db->prepare("UPDATE warehouse_restock_orders SET status = 'SHIPPED' WHERE id = ?")
+                ->execute([$orderId]);
+
+            if ($ownsTransaction) {
+                $this->db->commit();
+            }
+        } catch (Throwable $exception) {
+            if ($ownsTransaction && $this->db->inTransaction()) {
+                $this->db->rollBack();
+            }
+            throw $exception;
         }
-        $this->db->prepare("UPDATE warehouse_restock_orders SET status = 'SHIPPED' WHERE id = ?")
-            ->execute([$orderId]);
     }
 
     private function purchaseOrderStatus(array $payload, string $status): void
     {
-        $poId = $this->string($payload, 'po_id', 'purchase_request_id');
-        $requestId = isset($payload['purchase_request_id']) && \is_string($payload['purchase_request_id'])
-            ? $payload['purchase_request_id'] : $poId;
-        $statement = $this->db->prepare(
-            'SELECT * FROM purchase_requests WHERE po_id = ? OR id = ? LIMIT 1 FOR UPDATE'
-        );
-        $statement->execute([$poId, $requestId]);
-        $request = $statement->fetch();
-        if (!$request) {
-            throw new ApiException(404, 'Purchase request not found for PO event');
+        $ownsTransaction = !$this->db->inTransaction();
+        if ($ownsTransaction) {
+            $this->db->beginTransaction();
         }
-        $allowedTransitions = [
-            'REQUESTED' => ['CONFIRMED'],
-            'CONFIRMED' => ['SHIPPED'],
-            'SHIPPED' => ['DELIVERED'],
-            'DELIVERED' => [],
-            'PARTIALLY_RECEIVED' => [],
-            'RECEIVED' => [],
-        ];
-        if ($request['status'] === $status) {
-            return;
+
+        try {
+            $poId = $this->string($payload, 'po_id', 'purchase_request_id');
+            $requestId = isset($payload['purchase_request_id']) && \is_string($payload['purchase_request_id'])
+                ? $payload['purchase_request_id'] : $poId;
+            $statement = $this->db->prepare(
+                'SELECT id, po_id, status
+                 FROM purchase_requests
+                 WHERE po_id = ? OR id = ?
+                 ORDER BY created_at DESC, id DESC
+                 LIMIT 1'
+            );
+            $statement->execute([$poId, $requestId]);
+            $request = $statement->fetch();
+            if (!$request) {
+                throw new ApiException(404, 'Purchase request not found for PO event');
+            }
+            $allowedTransitions = [
+                'REQUESTED' => ['CONFIRMED'],
+                'CONFIRMED' => ['SHIPPED'],
+                'SHIPPED' => ['DELIVERED'],
+                'DELIVERED' => [],
+                'PARTIALLY_RECEIVED' => [],
+                'RECEIVED' => [],
+            ];
+            if ($request['status'] !== $status) {
+                if (!\in_array($status, $allowedTransitions[$request['status']] ?? [], true)) {
+                    throw new ApiException(409, "Invalid purchase order transition {$request['status']} -> {$status}");
+                }
+                $update = $this->db->prepare(
+                    'UPDATE purchase_requests
+                     SET po_id = COALESCE(po_id, ?), status = ?
+                     WHERE id = ? AND status = ?'
+                );
+                $update->execute([$poId, $status, $request['id'], $request['status']]);
+                if ($update->rowCount() !== 1) {
+                    throw new ApiException(409, 'Purchase order status changed concurrently');
+                }
+            }
+
+            if ($ownsTransaction) {
+                $this->db->commit();
+            }
+        } catch (Throwable $exception) {
+            if ($ownsTransaction && $this->db->inTransaction()) {
+                $this->db->rollBack();
+            }
+            throw $exception;
         }
-        if (!\in_array($status, $allowedTransitions[$request['status']] ?? [], true)) {
-            throw new ApiException(409, "Invalid purchase order transition {$request['status']} -> {$status}");
-        }
-        $update = $this->db->prepare(
-            'UPDATE purchase_requests SET po_id = COALESCE(po_id, ?), status = ? WHERE id = ?'
-        );
-        $update->execute([$poId, $status, $request['id']]);
     }
 
     private function items(array $payload): array
@@ -246,6 +307,25 @@ final class EventService
         throw new ApiException(422, implode(' or ', $keys) . ' is required');
     }
 
+    private function insertRestockItems(string $orderId, array $items): void
+    {
+        $placeholders = [];
+        $parameters = [];
+
+        foreach ($items as $item) {
+            $placeholders[] = '(?, ?, ?)';
+            $parameters[] = $orderId;
+            $parameters[] = $item['product_id'];
+            $parameters[] = $item['quantity'];
+        }
+
+        $statement = $this->db->prepare(
+            'INSERT INTO warehouse_restock_order_items (restock_order_id, product_id, quantity)
+             VALUES ' . implode(', ', $placeholders)
+        );
+        $statement->execute($parameters);
+    }
+
     private function activeWarehouse(string $id): void
     {
         $statement = $this->db->prepare('SELECT is_active FROM warehouses WHERE id = ?');
@@ -261,16 +341,27 @@ final class EventService
 
     private function lockStock(string $warehouseId, string $productId): array
     {
+        if (!$this->db->inTransaction()) {
+            throw new ApiException(409, 'Stock locking requires an active transaction');
+        }
+
         $insert = $this->db->prepare(
             'INSERT INTO warehouse_stocks (warehouse_id, product_id, quantity, reserved, min_stock)
              VALUES (?, ?, 0, 0, 0) ON DUPLICATE KEY UPDATE product_id = VALUES(product_id)'
         );
         $insert->execute([$warehouseId, $productId]);
+        // The upsert holds an InnoDB lock on this stock row for the surrounding transaction.
         $statement = $this->db->prepare(
-            'SELECT * FROM warehouse_stocks WHERE warehouse_id = ? AND product_id = ? FOR UPDATE'
+            'SELECT warehouse_id, product_id, quantity, reserved, min_stock, updated_at
+             FROM warehouse_stocks
+             WHERE warehouse_id = ? AND product_id = ?'
         );
         $statement->execute([$warehouseId, $productId]);
-        return $statement->fetch();
+        $stock = $statement->fetch();
+        if (!$stock) {
+            throw new ApiException(409, 'Stock row could not be initialized');
+        }
+        return $stock;
     }
 
     private function setReserved(string $warehouseId, string $productId, int $reserved): void
@@ -279,6 +370,44 @@ final class EventService
             'UPDATE warehouse_stocks SET reserved = ? WHERE warehouse_id = ? AND product_id = ?'
         );
         $statement->execute([$reserved, $warehouseId, $productId]);
+    }
+
+    private function updateShipmentStock(string $warehouseId, array $updates): void
+    {
+        if ($updates === []) {
+            return;
+        }
+
+        $quantityCases = [];
+        $reservedCases = [];
+        $productPlaceholders = [];
+        $parameters = [];
+
+        foreach ($updates as $update) {
+            $quantityCases[] = 'WHEN ? THEN ?';
+            $parameters[] = $update['product_id'];
+            $parameters[] = $update['quantity'];
+
+            $reservedCases[] = 'WHEN ? THEN ?';
+            $parameters[] = $update['product_id'];
+            $parameters[] = $update['reserved'];
+
+            $productPlaceholders[] = '?';
+        }
+
+        $parameters[] = $warehouseId;
+        foreach ($updates as $update) {
+            $parameters[] = $update['product_id'];
+        }
+
+        $quantityCaseSql = 'CASE product_id ' . implode(' ', $quantityCases) . ' END';
+        $reservedCaseSql = 'CASE product_id ' . implode(' ', $reservedCases) . ' END';
+        $statement = $this->db->prepare(
+            "UPDATE warehouse_stocks
+             SET quantity = {$quantityCaseSql}, reserved = {$reservedCaseSql}
+             WHERE warehouse_id = ? AND product_id IN (" . implode(', ', $productPlaceholders) . ')'
+        );
+        $statement->execute($parameters);
     }
 
     private function movement(

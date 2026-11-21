@@ -1,0 +1,231 @@
+<!doctype html>
+<html lang="id">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>Warehouse | GAS POL</title>
+  <link rel="stylesheet" href="dashboard.css">
+  <script src="dashboard.js" defer></script>
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar" id="sidebar">
+      <a class="brand" href="./" aria-label="GAS POL Warehouse home">
+        <span class="brand-mark">WH</span>
+        <span><strong>GAS POL</strong><small>Warehouse system</small></span>
+      </a>
+
+      <div class="nav-label">MENU UTAMA</div>
+      <nav class="side-nav" aria-label="Navigasi utama">
+        <button class="nav-link active" data-view="overview"><span class="nav-icon">◫</span>Ringkasan</button>
+        <button class="nav-link" data-view="warehouses"><span class="nav-icon">▦</span>Gudang</button>
+        <button class="nav-link" data-view="stocks"><span class="nav-icon">▤</span>Persediaan</button>
+        <button class="nav-link" data-view="restock"><span class="nav-icon">↻</span>Restock retail</button>
+        <button class="nav-link" data-view="purchases"><span class="nav-icon">⇧</span>Pembelian supplier</button>
+        <button class="nav-link" data-view="receipts"><span class="nav-icon">✓</span>Penerimaan barang</button>
+        <button class="nav-link" data-view="movements"><span class="nav-icon">≋</span>Riwayat stok</button>
+      </nav>
+
+      <div class="sidebar-bottom">
+        <div class="connection-card">
+          <span class="status-dot" id="connectionDot"></span>
+          <div><strong id="connectionLabel">Memeriksa koneksi</strong><small>Warehouse API</small></div>
+        </div>
+        <p class="sidebar-note">Inventory &amp; fulfillment</p>
+      </div>
+    </aside>
+
+    <main class="main-content">
+      <header class="topbar">
+        <button class="mobile-menu" id="mobileMenu" type="button" aria-label="Buka menu">☰</button>
+        <div class="breadcrumb"><span>Workspace</span><span class="crumb-separator">/</span><strong id="pageTitle">Ringkasan</strong></div>
+        <div class="topbar-actions">
+          <button class="button button-quiet" id="refreshButton" type="button"><span aria-hidden="true">↻</span> Muat ulang</button>
+          <span class="avatar" aria-label="Warehouse">WH</span>
+        </div>
+      </header>
+
+      <div class="content-wrap">
+        <section class="settings-panel" aria-labelledby="accessTitle">
+          <div class="settings-heading">
+            <div class="settings-icon">⌑</div>
+            <div><strong id="accessTitle">Akses API</strong><p>Masukkan token sesuai peran. Token hanya disimpan selama tab ini terbuka.</p></div>
+          </div>
+          <form id="tokenForm" class="token-form">
+            <label>Token warehouse manager
+              <input id="managerToken" type="password" autocomplete="off" placeholder="WAREHOUSE_MANAGER_TOKEN">
+            </label>
+            <label>Token owner
+              <input id="ownerToken" type="password" autocomplete="off" placeholder="OWNER_TOKEN">
+            </label>
+            <button class="button button-secondary" type="submit">Simpan token</button>
+          </form>
+        </section>
+
+        <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
+
+        <section class="view active" id="view-overview">
+          <div class="page-heading">
+            <div><p class="eyebrow">OVERVIEW</p><h1>Ringkasan warehouse</h1><p class="page-description">Pantau stok, permintaan restock, dan pesanan supplier.</p></div>
+            <span class="date-chip" id="todayLabel"></span>
+          </div>
+          <div class="metric-grid">
+            <article class="metric-card"><div class="metric-top"><span>Total gudang</span><span class="metric-icon icon-blue">▦</span></div><strong id="metricWarehouses">—</strong><small>Gudang terdaftar</small></article>
+            <article class="metric-card"><div class="metric-top"><span>SKU tersimpan</span><span class="metric-icon icon-green">▤</span></div><strong id="metricProducts">—</strong><small>Baris persediaan</small></article>
+            <article class="metric-card"><div class="metric-top"><span>Stok menipis</span><span class="metric-icon icon-orange">!</span></div><strong id="metricLowStock">—</strong><small>Di bawah batas minimum</small></article>
+            <article class="metric-card"><div class="metric-top"><span>Menunggu supplier</span><span class="metric-icon icon-purple">↻</span></div><strong id="metricWaiting">—</strong><small>Permintaan restock</small></article>
+          </div>
+          <div class="content-grid">
+            <article class="panel">
+              <div class="panel-heading"><div><h2>Stok perlu perhatian</h2><p>Produk dengan available di bawah minimum stock.</p></div><button class="text-button" data-go="stocks">Lihat stok <span>→</span></button></div>
+              <div class="table-wrap"><table><thead><tr><th>Produk</th><th>Gudang</th><th>Available</th><th>Minimum</th><th>Status</th></tr></thead><tbody id="overviewStockRows"></tbody></table></div>
+            </article>
+            <article class="panel">
+              <div class="panel-heading"><div><h2>Restock terbaru</h2><p>Permintaan dari retail.</p></div><button class="text-button" data-go="restock">Lihat semua <span>→</span></button></div>
+              <div class="compact-list" id="overviewRestockRows"></div>
+            </article>
+          </div>
+        </section>
+
+        <section class="view" id="view-warehouses">
+          <div class="page-heading">
+            <div><p class="eyebrow">MASTER DATA</p><h1>Gudang</h1><p class="page-description">Kelola lokasi warehouse dan status operasionalnya.</p></div>
+            <button class="button button-primary" id="addWarehouseButton" type="button"><span>＋</span> Tambah gudang</button>
+          </div>
+          <article class="panel">
+            <div class="panel-heading"><div><h2>Daftar gudang</h2><p>Master warehouse yang terdaftar di sistem.</p></div><span class="count-pill" id="warehouseCount">0</span></div>
+            <div class="table-wrap"><table><thead><tr><th>Kode</th><th>Nama gudang</th><th>Alamat</th><th>Status</th><th class="align-right">Aksi</th></tr></thead><tbody id="warehouseRows"></tbody></table></div>
+            <p class="table-hint" id="warehouseHint"></p>
+          </article>
+        </section>
+
+        <section class="view" id="view-stocks">
+          <div class="page-heading">
+            <div><p class="eyebrow">INVENTORY</p><h1>Persediaan</h1><p class="page-description">Lihat ketersediaan dan lakukan penyesuaian stok.</p></div>
+          </div>
+          <article class="panel">
+            <div class="panel-heading"><div><h2>Penyesuaian stok</h2><p>Perubahan dicatat sebagai stock movement.</p></div></div>
+            <form id="adjustForm" class="form-grid">
+              <label>ID gudang<input name="warehouse_id" list="warehouseOptions" required placeholder="UUID gudang"></label>
+              <label>Product ID<input name="product_id" required placeholder="Contoh: SKU-001"></label>
+              <label>Perubahan quantity<input name="quantity_delta" type="number" step="1" placeholder="Contoh: 20 atau -2"></label>
+              <label>Minimum stock<input name="min_stock" type="number" min="0" step="1" placeholder="Tidak diubah"></label>
+              <label class="form-span-2">Alasan penyesuaian<input name="reason" placeholder="Wajib jika quantity berubah"></label>
+              <div class="form-actions form-span-2"><button class="button button-primary" type="submit">Simpan penyesuaian</button></div>
+            </form>
+          </article>
+          <article class="panel">
+            <div class="panel-heading"><div><h2>Daftar stok</h2><p>Available dihitung dari quantity dikurangi reserved.</p></div></div>
+            <form id="stockFilterForm" class="filter-row">
+              <label>ID gudang<input name="warehouse_id" list="warehouseOptions" placeholder="Semua gudang"></label>
+              <label>Product ID<input name="product_id" placeholder="Semua produk"></label>
+              <button class="button button-secondary" type="submit">Terapkan filter</button>
+              <button class="button button-quiet" type="reset">Bersihkan</button>
+            </form>
+            <div class="table-wrap"><table><thead><tr><th>Product ID</th><th>Gudang</th><th>Quantity</th><th>Reserved</th><th>Available</th><th>Minimum</th><th>Pembaruan</th></tr></thead><tbody id="stockRows"></tbody></table></div>
+            <p class="table-hint" id="stockHint"></p>
+          </article>
+        </section>
+
+        <section class="view" id="view-restock">
+          <div class="page-heading">
+            <div><p class="eyebrow">FULFILLMENT</p><h1>Restock retail</h1><p class="page-description">Kelola permintaan retail dan pantau status reservasi stok.</p></div>
+          </div>
+          <article class="panel">
+            <div class="panel-heading"><div><h2>Permintaan restock</h2><p>Order masuk melalui event <code>restock.requested</code>.</p></div></div>
+            <form id="restockFilterForm" class="filter-row">
+              <label>Status<select name="status"><option value="">Semua status</option><option>WAITING_SUPPLIER</option><option>RESERVED</option><option>SHIPPED</option><option>REJECTED</option></select></label>
+              <label>ID gudang<input name="warehouse_id" list="warehouseOptions" placeholder="Semua gudang"></label>
+              <button class="button button-secondary" type="submit">Terapkan filter</button>
+              <button class="button button-quiet" type="reset">Bersihkan</button>
+            </form>
+            <div class="table-wrap"><table><thead><tr><th>Order ID</th><th>Retail</th><th>Gudang</th><th>Item</th><th>Status</th><th>Dibuat</th><th class="align-right">Aksi</th></tr></thead><tbody id="restockRows"></tbody></table></div>
+            <p class="table-hint" id="restockHint"></p>
+          </article>
+        </section>
+
+        <section class="view" id="view-purchases">
+          <div class="page-heading">
+            <div><p class="eyebrow">PROCUREMENT</p><h1>Pembelian supplier</h1><p class="page-description">Buat purchase request dan pantau progres pengadaan.</p></div>
+          </div>
+          <div class="content-grid content-grid-wide">
+            <article class="panel">
+              <div class="panel-heading"><div><h2>Purchase request baru</h2><p>Request akan menerbitkan event <code>po.requested</code>.</p></div></div>
+              <form id="purchaseForm" class="form-grid form-grid-single">
+                <label>Supplier ID<input name="supplier_id" required placeholder="ID supplier"></label>
+                <label>ID gudang default<input name="warehouse_id" list="warehouseOptions" placeholder="Opsional jika diisi per item"></label>
+                <label>Item pembelian <small>Format per baris: product_id, quantity[, warehouse_id]</small><textarea name="items" rows="5" required placeholder="SKU-001, 20&#10;SKU-002, 10"></textarea></label>
+                <button class="button button-primary" type="submit">Buat purchase request</button>
+              </form>
+            </article>
+            <article class="panel">
+              <div class="panel-heading"><div><h2>Penerimaan barang</h2><p>Hanya dapat diproses setelah PO berstatus delivered.</p></div></div>
+              <form id="receiptForm" class="form-grid form-grid-single">
+                <label>Purchase request / PO ID<input name="po_id" list="purchaseOptions" required placeholder="ID request atau PO ID"></label>
+                <label>Barang diterima <small>Format per baris: product_id, quantity[, warehouse_id]</small><textarea name="items" rows="5" required placeholder="SKU-001, 10"></textarea></label>
+                <button class="button button-secondary" type="submit">Catat penerimaan</button>
+              </form>
+            </article>
+          </div>
+          <article class="panel">
+            <div class="panel-heading"><div><h2>Purchase request</h2><p>Status dan rincian item dari supplier.</p></div><span class="count-pill" id="purchaseCount">0</span></div>
+            <div class="table-wrap"><table><thead><tr><th>Request ID</th><th>PO ID</th><th>Supplier</th><th>Item</th><th>Status</th><th>Dibuat</th></tr></thead><tbody id="purchaseRows"></tbody></table></div>
+            <p class="table-hint" id="purchaseHint"></p>
+          </article>
+        </section>
+
+        <section class="view" id="view-receipts">
+          <div class="page-heading">
+            <div><p class="eyebrow">GOODS RECEIPT</p><h1>Penerimaan barang</h1><p class="page-description">Catat barang yang diterima untuk purchase request berstatus delivered.</p></div>
+            <button class="button button-secondary" data-go="purchases" type="button">Buat penerimaan</button>
+          </div>
+          <article class="panel info-panel">
+            <div class="info-symbol">i</div><div><strong>Alur penerimaan</strong><p>Pilih request yang statusnya <code>DELIVERED</code> di daftar pembelian. Barang yang diterima menambah stok gudang, tercatat dalam stock movement, dan memicu ulang order restock yang menunggu.</p></div>
+          </article>
+          <article class="panel">
+            <div class="panel-heading"><div><h2>Purchase request siap diterima</h2><p>Gunakan ID request sebagai PO ID jika belum ada ID dari supplier.</p></div></div>
+            <div class="table-wrap"><table><thead><tr><th>Request ID</th><th>PO ID</th><th>Supplier</th><th>Barang diterima</th><th>Status</th><th>Dibuat</th></tr></thead><tbody id="receiptPurchaseRows"></tbody></table></div>
+          </article>
+        </section>
+
+        <section class="view" id="view-movements">
+          <div class="page-heading">
+            <div><p class="eyebrow">AUDIT TRAIL</p><h1>Riwayat pergerakan stok</h1><p class="page-description">Jejak audit untuk penyesuaian, reservasi, penerimaan, dan pengiriman.</p></div>
+          </div>
+          <article class="panel">
+            <div class="panel-heading"><div><h2>Stock movements</h2><p>Menampilkan maksimal 500 catatan terbaru.</p></div></div>
+            <form id="movementFilterForm" class="filter-row">
+              <label>ID gudang<input name="warehouse_id" list="warehouseOptions" placeholder="Semua gudang"></label>
+              <label>Product ID<input name="product_id" placeholder="Semua produk"></label>
+              <label>Tipe<select name="movement_type"><option value="">Semua tipe</option><option>IN</option><option>OUT</option><option>RESERVE</option><option>RELEASE</option></select></label>
+              <label>Reference ID<input name="reference_id" placeholder="ID referensi"></label>
+              <button class="button button-secondary" type="submit">Terapkan filter</button>
+              <button class="button button-quiet" type="reset">Bersihkan</button>
+            </form>
+            <div class="table-wrap"><table><thead><tr><th>Waktu</th><th>Produk</th><th>Tipe</th><th>Jumlah</th><th>Quantity</th><th>Reserved</th><th>Referensi</th></tr></thead><tbody id="movementRows"></tbody></table></div>
+            <p class="table-hint" id="movementHint"></p>
+          </article>
+        </section>
+
+        <datalist id="warehouseOptions"></datalist>
+        <datalist id="purchaseOptions"></datalist>
+      </div>
+    </main>
+  </div>
+
+  <dialog id="warehouseDialog" class="form-dialog">
+    <form id="warehouseForm" method="dialog">
+      <div class="dialog-heading"><div><p class="eyebrow">MASTER DATA</p><h2 id="warehouseDialogTitle">Tambah gudang</h2></div><button class="icon-button" type="button" id="closeWarehouseDialog" aria-label="Tutup">×</button></div>
+      <input type="hidden" name="id">
+      <label>Kode gudang<input name="code" maxlength="64" required placeholder="WH-01"></label>
+      <label>Nama gudang<input name="name" maxlength="150" required placeholder="Warehouse Jakarta"></label>
+      <label>Alamat<textarea name="address" maxlength="500" rows="3" placeholder="Alamat gudang"></textarea></label>
+      <label class="checkbox-label" id="warehouseActiveRow" hidden><input name="is_active" type="checkbox" checked> Gudang aktif</label>
+      <div class="dialog-actions"><button class="button button-quiet" type="button" id="cancelWarehouseButton">Batal</button><button class="button button-primary" type="submit">Simpan gudang</button></div>
+    </form>
+  </dialog>
+
+  <footer class="app-footer">GAS POL Warehouse <span>•</span> Inventory &amp; fulfillment</footer>
+</body>
+</html>

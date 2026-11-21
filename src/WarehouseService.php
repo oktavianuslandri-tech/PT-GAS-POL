@@ -15,12 +15,18 @@ final class WarehouseService
 
     public function listWarehouses(): array
     {
-        return $this->db->query('SELECT * FROM warehouses ORDER BY name')->fetchAll();
+        return $this->db->query(
+            'SELECT id, code, name, address, is_active, created_at, updated_at
+             FROM warehouses ORDER BY name'
+        )->fetchAll();
     }
 
     public function getWarehouse(string $id): array
     {
-        $statement = $this->db->prepare('SELECT * FROM warehouses WHERE id = ?');
+        $statement = $this->db->prepare(
+            'SELECT id, code, name, address, is_active, created_at, updated_at
+             FROM warehouses WHERE id = ?'
+        );
         $statement->execute([$id]);
         return $statement->fetch() ?: throw new ApiException(404, 'Warehouse not found');
     }
@@ -98,54 +104,24 @@ final class WarehouseService
         }
     }
 
-public function listStocks(array $filters): array
-{
-    $sql = 'SELECT s.warehouse_id, w.code AS warehouse_code, w.name AS warehouse_name,
-                   s.product_id, s.quantity, s.reserved, s.min_stock,
-                   (s.quantity - s.reserved) AS available, s.updated_at
-            FROM warehouse_stocks s
-            JOIN warehouses w ON w.id = s.warehouse_id
-            WHERE 1 = 1';
-
-    $values = [];
-
-    if (!empty($filters['warehouse_id'])) {
-        $sql .= ' AND s.warehouse_id = ?';
-        $values[] = $filters['warehouse_id'];
+    public function listStocks(array $filters): array
+    {
+        $sql = 'SELECT s.warehouse_id, w.code AS warehouse_code, w.name AS warehouse_name,
+                       s.product_id, s.quantity, s.reserved, s.min_stock,
+                       (s.quantity - s.reserved) AS available, s.updated_at
+                FROM warehouse_stocks s JOIN warehouses w ON w.id = s.warehouse_id WHERE 1 = 1';
+        $values = [];
+        foreach (['warehouse_id', 'product_id'] as $field) {
+            if (isset($filters[$field]) && $filters[$field] !== '') {
+                $sql .= " AND s.{$field} = ?";
+                $values[] = $filters[$field];
+            }
+        }
+        $sql .= ' ORDER BY w.name, s.product_id';
+        $statement = $this->db->prepare($sql);
+        $statement->execute($values);
+        return $statement->fetchAll();
     }
-
-    if (!empty($filters['product_id'])) {
-        $sql .= ' AND s.product_id LIKE ?';
-        $values[] = '%' . trim($filters['product_id']) . '%';
-    }
-
-    if (isset($filters['low_stock']) && $filters['low_stock'] === 'true') {
-        $sql .= ' AND s.quantity - s.reserved <= s.min_stock';
-    }
-
-    $allowedSort = [
-        'quantity' => 's.quantity',
-        'available' => '(s.quantity - s.reserved)',
-        'updated_at' => 's.updated_at',
-        'product_id' => 's.product_id',
-    ];
-
-    $sort = $filters['sort'] ?? 'product_id';
-    $order = strtoupper($filters['order'] ?? 'ASC');
-
-    $sortColumn = $allowedSort[$sort] ?? 's.product_id';
-
-    if (!in_array($order, ['ASC', 'DESC'], true)) {
-        $order = 'ASC';
-    }
-
-    $sql .= " ORDER BY {$sortColumn} {$order}";
-
-    $statement = $this->db->prepare($sql);
-    $statement->execute($values);
-
-    return $statement->fetchAll();
-}
 
     public function adjustStock(array $input): array
     {
@@ -160,9 +136,24 @@ public function listStocks(array $filters): array
         if ($minStock !== null && $minStock < 0) {
             throw new ApiException(422, 'min_stock must be zero or greater');
         }
-        return $this->transaction(function () use ($warehouseId, $productId, $delta, $reason, $minStock): array {
+        $this->db->beginTransaction();
+        try {
             $this->assertActiveWarehouse($warehouseId);
-            $stock = $this->lockStock($warehouseId, $productId);
+            $insert = $this->db->prepare(
+                'INSERT INTO warehouse_stocks (warehouse_id, product_id, quantity, reserved, min_stock)
+                 VALUES (?, ?, 0, 0, 0) ON DUPLICATE KEY UPDATE product_id = VALUES(product_id)'
+            );
+            $insert->execute([$warehouseId, $productId]);
+            // The upsert holds an InnoDB lock on this stock row for the surrounding transaction.
+            $statement = $this->db->prepare(
+                'SELECT warehouse_id, product_id, quantity, reserved, min_stock, updated_at
+                 FROM warehouse_stocks WHERE warehouse_id = ? AND product_id = ?'
+            );
+            $statement->execute([$warehouseId, $productId]);
+            $stock = $statement->fetch();
+            if (!$stock) {
+                throw new ApiException(409, 'Stock row could not be initialized');
+            }
             $newQuantity = (int) $stock['quantity'] + $delta;
             if ($newQuantity < (int) $stock['reserved']) {
                 throw new ApiException(409, 'Adjustment would reduce quantity below the reserved amount');
@@ -190,13 +181,23 @@ public function listStocks(array $filters): array
                     (int) $stock['reserved']
                 );
             }
-            return $this->stockRow($warehouseId, $productId);
-        });
+            $result = $this->stockRow($warehouseId, $productId);
+            $this->db->commit();
+            return $result;
+        } catch (Throwable $exception) {
+            if ($this->db->inTransaction()) {
+                $this->db->rollBack();
+            }
+            throw $exception;
+        }
     }
 
     public function listMovements(array $filters): array
     {
-        $sql = 'SELECT * FROM stock_movements WHERE 1 = 1';
+        $sql = 'SELECT id, warehouse_id, product_id, movement_type, quantity, reference_type,
+                       reference_id, quantity_before, quantity_after, reserved_before,
+                       reserved_after, created_at
+                FROM stock_movements WHERE 1 = 1';
         $values = [];
         foreach (['warehouse_id', 'product_id', 'movement_type', 'reference_id'] as $field) {
             if (isset($filters[$field]) && $filters[$field] !== '') {
@@ -212,7 +213,8 @@ public function listStocks(array $filters): array
 
     public function listRestockOrders(array $filters): array
     {
-        $sql = 'SELECT * FROM warehouse_restock_orders WHERE 1 = 1';
+        $sql = 'SELECT id, warehouse_id, retail_id, status, rejection_reason, created_at, updated_at
+                FROM warehouse_restock_orders WHERE 1 = 1';
         $values = [];
         if (!empty($filters['status'])) {
             $sql .= ' AND status = ?';
@@ -232,7 +234,9 @@ public function listStocks(array $filters): array
         $ids = array_column($orders, 'id');
         $placeholders = \implode(',', \array_fill(0, \count($ids), '?'));
         $items = $this->db->prepare(
-            "SELECT * FROM warehouse_restock_order_items WHERE restock_order_id IN ({$placeholders}) ORDER BY product_id"
+            "SELECT restock_order_id, product_id, quantity
+             FROM warehouse_restock_order_items
+             WHERE restock_order_id IN ({$placeholders}) ORDER BY product_id"
         );
         $items->execute($ids);
         $byOrder = [];
@@ -248,32 +252,90 @@ public function listStocks(array $filters): array
     public function rejectRestockOrder(string $id, array $input): array
     {
         $reason = $this->optionalString($input, 'reason');
-        return $this->transaction(function () use ($id, $reason): array {
-            $order = $this->lockRestockOrder($id);
+        $this->db->beginTransaction();
+        try {
+            $statement = $this->db->prepare(
+                'SELECT id, warehouse_id, retail_id, status, rejection_reason, created_at, updated_at
+                 FROM warehouse_restock_orders WHERE id = ? FOR UPDATE'
+            );
+            $statement->execute([$id]);
+            $order = $statement->fetch() ?: throw new ApiException(404, 'Restock order not found');
             if (!\in_array($order['status'], ['WAITING_SUPPLIER', 'RESERVED'], true)) {
                 throw new ApiException(409, 'Only waiting or reserved orders can be rejected');
             }
             if ($order['status'] === 'RESERVED') {
-                foreach ($this->restockItems($id) as $item) {
-                    $stock = $this->lockStock($order['warehouse_id'], $item['product_id']);
+                $items = $this->restockItems($id);
+                $stockRows = $this->uniqueStockRows(array_map(
+                    static fn(array $item): array => [
+                        'warehouse_id' => $order['warehouse_id'],
+                        'product_id' => $item['product_id'],
+                    ],
+                    $items
+                ));
+                $this->insertStockRows($stockRows);
+
+                $productPlaceholders = \implode(',', \array_fill(0, \count($stockRows), '?'));
+                $stockStatement = $this->db->prepare(
+                    'SELECT warehouse_id, product_id, quantity, reserved, min_stock, updated_at
+                     FROM warehouse_stocks
+                     WHERE warehouse_id = ? AND product_id IN (' . $productPlaceholders . ')
+                     ORDER BY product_id'
+                );
+                $stockStatement->execute(array_merge(
+                    [$order['warehouse_id']],
+                    array_column($stockRows, 'product_id')
+                ));
+                $stocksByProduct = [];
+                foreach ($stockStatement->fetchAll() as $stock) {
+                    $stocksByProduct[$stock['product_id']] = $stock;
+                }
+
+                $reservedUpdates = [];
+                $movements = [];
+                foreach ($items as $item) {
+                    $stock = $stocksByProduct[$item['product_id']] ?? null;
+                    if (!$stock) {
+                        throw new ApiException(409, 'Stock row could not be initialized');
+                    }
                     $reserved = (int) $stock['reserved'] - (int) $item['quantity'];
                     if ($reserved < 0) {
                         throw new ApiException(409, 'Reserved stock is inconsistent for this order');
                     }
-                    $this->setReserved($order['warehouse_id'], $item['product_id'], $reserved);
-                    $this->movement(
-                        $order['warehouse_id'], $item['product_id'], 'RELEASE', (int) $item['quantity'],
-                        'RESTOCK_ORDER', $id, (int) $stock['quantity'], (int) $stock['quantity'],
-                        (int) $stock['reserved'], $reserved
-                    );
+                    $key = $this->stockKey($order['warehouse_id'], $item['product_id']);
+                    $reservedUpdates[$key] = [
+                        'warehouse_id' => $order['warehouse_id'],
+                        'product_id' => $item['product_id'],
+                        'reserved' => $reserved,
+                    ];
+                    $movements[] = [
+                        'warehouse_id' => $order['warehouse_id'],
+                        'product_id' => $item['product_id'],
+                        'movement_type' => 'RELEASE',
+                        'quantity' => (int) $item['quantity'],
+                        'reference_type' => 'RESTOCK_ORDER',
+                        'reference_id' => $id,
+                        'quantity_before' => (int) $stock['quantity'],
+                        'quantity_after' => (int) $stock['quantity'],
+                        'reserved_before' => (int) $stock['reserved'],
+                        'reserved_after' => $reserved,
+                    ];
                 }
+                $this->updateReservedStocks(array_values($reservedUpdates));
+                $this->insertMovements($movements);
             }
             $statement = $this->db->prepare(
                 'UPDATE warehouse_restock_orders SET status = ?, rejection_reason = ? WHERE id = ?'
             );
             $statement->execute(['REJECTED', $reason, $id]);
-            return $this->restockOrder($id);
-        });
+            $result = $this->restockOrder($id);
+            $this->db->commit();
+            return $result;
+        } catch (Throwable $exception) {
+            if ($this->db->inTransaction()) {
+                $this->db->rollBack();
+            }
+            throw $exception;
+        }
     }
 
     public function createPurchaseRequest(array $input): array
@@ -281,32 +343,46 @@ public function listStocks(array $filters): array
         $supplierId = $this->requiredString($input, 'supplier_id');
         $items = $this->inputItems($input);
         $defaultWarehouseId = isset($input['warehouse_id']) ? $this->requiredString($input, 'warehouse_id') : null;
+        $purchaseItems = [];
+        foreach ($items as $item) {
+            $warehouseId = $item['warehouse_id'] ?? $defaultWarehouseId;
+            if (!\is_string($warehouseId) || $warehouseId === '') {
+                throw new ApiException(422, 'Provide warehouse_id for the request or each item');
+            }
+            $purchaseItems[] = [
+                'warehouse_id' => $warehouseId,
+                'product_id' => $item['product_id'],
+                'quantity' => $item['quantity'],
+            ];
+        }
         $id = $this->uuid();
-        $this->transaction(function () use ($id, $supplierId, $items, $defaultWarehouseId): void {
+        $this->transaction(function () use ($id, $supplierId, $purchaseItems): void {
+            $this->assertActiveWarehouses(array_column($purchaseItems, 'warehouse_id'));
             $statement = $this->db->prepare(
                 'INSERT INTO purchase_requests (id, supplier_id, status) VALUES (?, ?, ?)'
             );
             $statement->execute([$id, $supplierId, 'REQUESTED']);
-            foreach ($items as $item) {
-                $warehouseId = $item['warehouse_id'] ?? $defaultWarehouseId;
-                if (!\is_string($warehouseId) || $warehouseId === '') {
-                    throw new ApiException(422, 'Provide warehouse_id for the request or each item');
-                }
-                $this->assertActiveWarehouse($warehouseId);
-                $insert = $this->db->prepare(
-                    'INSERT INTO purchase_request_items (purchase_request_id, warehouse_id, product_id, quantity)
-                     VALUES (?, ?, ?, ?)'
-                );
-                $insert->execute([$id, $warehouseId, $item['product_id'], $item['quantity']]);
+
+            $placeholders = [];
+            $parameters = [];
+            foreach ($purchaseItems as $item) {
+                $placeholders[] = '(?, ?, ?, ?)';
+                $parameters[] = $id;
+                $parameters[] = $item['warehouse_id'];
+                $parameters[] = $item['product_id'];
+                $parameters[] = $item['quantity'];
             }
+            $insert = $this->db->prepare(
+                'INSERT INTO purchase_request_items
+                 (purchase_request_id, warehouse_id, product_id, quantity)
+                 VALUES ' . implode(', ', $placeholders)
+            );
+            $insert->execute($parameters);
+
             $this->addOutbox('po.requested', [
                 'purchase_request_id' => $id,
                 'supplier_id' => $supplierId,
-                'items' => array_map(static fn(array $item): array => [
-                    'warehouse_id' => $item['warehouse_id'] ?? $defaultWarehouseId,
-                    'product_id' => $item['product_id'],
-                    'quantity' => $item['quantity'],
-                ], $items),
+                'items' => $purchaseItems,
             ]);
         });
         return $this->purchaseRequest($id);
@@ -314,7 +390,8 @@ public function listStocks(array $filters): array
 
     public function listPurchaseRequests(array $filters): array
     {
-        $sql = 'SELECT * FROM purchase_requests WHERE 1 = 1';
+        $sql = 'SELECT id, po_id, supplier_id, status, created_at, updated_at
+                FROM purchase_requests WHERE 1 = 1';
         $values = [];
         if (!empty($filters['status'])) {
             $sql .= ' AND status = ?';
@@ -334,7 +411,9 @@ public function listStocks(array $filters): array
         $ids = array_column($requests, 'id');
         $placeholders = \implode(',', \array_fill(0, \count($ids), '?'));
         $items = $this->db->prepare(
-            "SELECT * FROM purchase_request_items WHERE purchase_request_id IN ({$placeholders}) ORDER BY product_id"
+            "SELECT purchase_request_id, warehouse_id, product_id, quantity, received_quantity
+             FROM purchase_request_items
+             WHERE purchase_request_id IN ({$placeholders}) ORDER BY product_id"
         );
         $items->execute($ids);
         $byRequest = [];
@@ -352,8 +431,17 @@ public function listStocks(array $filters): array
         $poId = $this->requiredString($input, 'po_id');
         $items = $this->inputItems($input);
         $receiptId = $this->uuid();
-        return $this->transaction(function () use ($poId, $items, $receiptId): array {
-            $purchase = $this->lockPurchaseRequest($poId);
+        $this->db->beginTransaction();
+        try {
+            $purchaseStatement = $this->db->prepare(
+                'SELECT id, po_id, supplier_id, status, created_at, updated_at
+                 FROM purchase_requests
+                 WHERE po_id = ? OR id = ?
+                 ORDER BY created_at DESC, id DESC
+                 LIMIT 1 FOR UPDATE'
+            );
+            $purchaseStatement->execute([$poId, $poId]);
+            $purchase = $purchaseStatement->fetch() ?: throw new ApiException(404, 'Purchase order not found');
             if (!\in_array($purchase['status'], ['DELIVERED', 'PARTIALLY_RECEIVED'], true)) {
                 throw new ApiException(409, 'Goods can only be received after the PO is delivered');
             }
@@ -361,33 +449,115 @@ public function listStocks(array $filters): array
                 'INSERT INTO goods_receipts (id, purchase_request_id) VALUES (?, ?)'
             );
             $statement->execute([$receiptId, $purchase['id']]);
+            $receiptLines = [];
+            $productIds = array_values(array_unique(array_column($items, 'product_id')));
+            $productPlaceholders = \implode(',', \array_fill(0, \count($productIds), '?'));
+            // The purchase request row is already locked above, serializing receipts for its item rows.
+            $lineStatement = $this->db->prepare(
+                'SELECT purchase_request_id, warehouse_id, product_id, quantity, received_quantity
+                 FROM purchase_request_items
+                 WHERE purchase_request_id = ? AND product_id IN (' . $productPlaceholders . ')
+                 ORDER BY warehouse_id, product_id'
+            );
+            $lineStatement->execute(array_merge([$purchase['id']], $productIds));
+            $linesByProduct = [];
+            foreach ($lineStatement->fetchAll() as $line) {
+                $linesByProduct[$line['product_id']][] = $line;
+            }
+            $receiptLineKeys = [];
             foreach ($items as $item) {
-                $line = $this->lockPurchaseItem($purchase['id'], $item['product_id'], $item['warehouse_id'] ?? null);
+                $lines = $linesByProduct[$item['product_id']] ?? [];
+                if (isset($item['warehouse_id'])) {
+                    $lines = array_values(array_filter(
+                        $lines,
+                        static fn(array $line): bool => $line['warehouse_id'] === $item['warehouse_id']
+                    ));
+                }
+                if (\count($lines) !== 1) {
+                    throw new ApiException(422, 'Receipt item must match exactly one PO line; include warehouse_id if needed');
+                }
+                $line = $lines[0];
+                $lineKey = $this->stockKey($line['warehouse_id'], $line['product_id']);
+                if (isset($receiptLineKeys[$lineKey])) {
+                    throw new ApiException(422, 'Duplicate product/warehouse receipt items are not allowed');
+                }
+                $receiptLineKeys[$lineKey] = true;
                 $qty = $item['quantity'];
                 if ((int) $line['received_quantity'] + $qty > (int) $line['quantity']) {
                     throw new ApiException(409, 'Receipt quantity exceeds the outstanding PO quantity');
                 }
-                $stock = $this->lockStock($line['warehouse_id'], $line['product_id']);
-                $newQuantity = (int) $stock['quantity'] + $qty;
-                $updateStock = $this->db->prepare(
-                    'UPDATE warehouse_stocks SET quantity = ? WHERE warehouse_id = ? AND product_id = ?'
-                );
-                $updateStock->execute([$newQuantity, $line['warehouse_id'], $line['product_id']]);
-                $updateLine = $this->db->prepare(
-                    'UPDATE purchase_request_items SET received_quantity = received_quantity + ?
-                     WHERE purchase_request_id = ? AND warehouse_id = ? AND product_id = ?'
-                );
-                $updateLine->execute([$qty, $purchase['id'], $line['warehouse_id'], $line['product_id']]);
-                $receiptItem = $this->db->prepare(
-                    'INSERT INTO goods_receipt_items (goods_receipt_id, warehouse_id, product_id, quantity)
-                     VALUES (?, ?, ?, ?)'
-                );
-                $receiptItem->execute([$receiptId, $line['warehouse_id'], $line['product_id'], $qty]);
-                $this->movement(
-                    $line['warehouse_id'], $line['product_id'], 'IN', $qty, 'GOODS_RECEIPT', $receiptId,
-                    (int) $stock['quantity'], $newQuantity, (int) $stock['reserved'], (int) $stock['reserved']
-                );
+                $receiptLines[] = ['line' => $line, 'quantity' => $qty];
             }
+            $stockRows = $this->uniqueStockRows(array_map(
+                static fn(array $receiptLine): array => [
+                    'warehouse_id' => $receiptLine['line']['warehouse_id'],
+                    'product_id' => $receiptLine['line']['product_id'],
+                ],
+                $receiptLines
+            ));
+            $this->insertStockRows($stockRows);
+            $stockConditions = [];
+            $stockParameters = [];
+            foreach ($stockRows as $stockRow) {
+                $stockConditions[] = '(warehouse_id = ? AND product_id = ?)';
+                $stockParameters[] = $stockRow['warehouse_id'];
+                $stockParameters[] = $stockRow['product_id'];
+            }
+            $stockStatement = $this->db->prepare(
+                'SELECT warehouse_id, product_id, quantity, reserved, min_stock, updated_at
+                 FROM warehouse_stocks WHERE ' . implode(' OR ', $stockConditions) . '
+                 ORDER BY warehouse_id, product_id'
+            );
+            $stockStatement->execute($stockParameters);
+            $stocksByKey = [];
+            foreach ($stockStatement->fetchAll() as $stock) {
+                $stocksByKey[$this->stockKey($stock['warehouse_id'], $stock['product_id'])] = $stock;
+            }
+
+            $stockUpdates = [];
+            $receivedUpdates = [];
+            $receiptItems = [];
+            $movements = [];
+            foreach ($receiptLines as $receiptLine) {
+                $line = $receiptLine['line'];
+                $qty = $receiptLine['quantity'];
+                $stock = $stocksByKey[$this->stockKey($line['warehouse_id'], $line['product_id'])] ?? null;
+                if (!$stock) {
+                    throw new ApiException(409, 'Stock row could not be initialized');
+                }
+                $newQuantity = (int) $stock['quantity'] + $qty;
+                $stockUpdates[] = [
+                    'warehouse_id' => $line['warehouse_id'],
+                    'product_id' => $line['product_id'],
+                    'quantity' => $newQuantity,
+                ];
+                $receivedUpdates[] = [
+                    'warehouse_id' => $line['warehouse_id'],
+                    'product_id' => $line['product_id'],
+                    'quantity' => $qty,
+                ];
+                $receiptItems[] = [
+                    'warehouse_id' => $line['warehouse_id'],
+                    'product_id' => $line['product_id'],
+                    'quantity' => $qty,
+                ];
+                $movements[] = [
+                    'warehouse_id' => $line['warehouse_id'],
+                    'product_id' => $line['product_id'],
+                    'movement_type' => 'IN',
+                    'quantity' => $qty,
+                    'reference_type' => 'GOODS_RECEIPT',
+                    'reference_id' => $receiptId,
+                    'quantity_before' => (int) $stock['quantity'],
+                    'quantity_after' => $newQuantity,
+                    'reserved_before' => (int) $stock['reserved'],
+                    'reserved_after' => (int) $stock['reserved'],
+                ];
+            }
+            $this->insertReceiptItems($receiptId, $receiptItems);
+            $this->updateReceivedStock($stockUpdates);
+            $this->updateReceivedQuantities($purchase['id'], $receivedUpdates);
+            $this->insertMovements($movements);
             $remaining = $this->db->prepare(
                 'SELECT COUNT(*) FROM purchase_request_items
                  WHERE purchase_request_id = ? AND received_quantity < quantity'
@@ -397,41 +567,236 @@ public function listStocks(array $filters): array
             $this->db->prepare('UPDATE purchase_requests SET status = ? WHERE id = ?')
                 ->execute([$status, $purchase['id']]);
             $this->processWaitingOrders();
-            return $this->goodsReceipt($receiptId);
-        });
+            $result = $this->goodsReceipt($receiptId);
+            $this->db->commit();
+            return $result;
+        } catch (Throwable $exception) {
+            if ($this->db->inTransaction()) {
+                $this->db->rollBack();
+            }
+            throw $exception;
+        }
+    }
+
+    private function insertReceiptItems(string $receiptId, array $items): void
+    {
+        if ($items === []) {
+            return;
+        }
+
+        $placeholders = [];
+        $parameters = [];
+        foreach ($items as $item) {
+            $placeholders[] = '(?, ?, ?, ?)';
+            $parameters[] = $receiptId;
+            $parameters[] = $item['warehouse_id'];
+            $parameters[] = $item['product_id'];
+            $parameters[] = $item['quantity'];
+        }
+
+        $statement = $this->db->prepare(
+            'INSERT INTO goods_receipt_items
+             (goods_receipt_id, warehouse_id, product_id, quantity)
+             VALUES ' . implode(', ', $placeholders)
+        );
+        $statement->execute($parameters);
+    }
+
+    private function updateReceivedStock(array $updates): void
+    {
+        if ($updates === []) {
+            return;
+        }
+
+        $quantityCases = [];
+        $keyConditions = [];
+        $parameters = [];
+
+        foreach ($updates as $update) {
+            $quantityCases[] = 'WHEN warehouse_id = ? AND product_id = ? THEN ?';
+            $parameters[] = $update['warehouse_id'];
+            $parameters[] = $update['product_id'];
+            $parameters[] = $update['quantity'];
+
+            $keyConditions[] = '(warehouse_id = ? AND product_id = ?)';
+            $parameters[] = $update['warehouse_id'];
+            $parameters[] = $update['product_id'];
+        }
+
+        $statement = $this->db->prepare(
+            'UPDATE warehouse_stocks
+             SET quantity = CASE ' . implode(' ', $quantityCases) . ' ELSE quantity END
+             WHERE ' . implode(' OR ', $keyConditions)
+        );
+        $statement->execute($parameters);
+    }
+
+    private function updateReceivedQuantities(string $purchaseRequestId, array $updates): void
+    {
+        if ($updates === []) {
+            return;
+        }
+
+        $quantityCases = [];
+        $keyConditions = [];
+        $caseParameters = [];
+        $keyParameters = [];
+
+        foreach ($updates as $update) {
+            $quantityCases[] = 'WHEN warehouse_id = ? AND product_id = ? THEN received_quantity + ?';
+            $caseParameters[] = $update['warehouse_id'];
+            $caseParameters[] = $update['product_id'];
+            $caseParameters[] = $update['quantity'];
+
+            $keyConditions[] = '(warehouse_id = ? AND product_id = ?)';
+            $keyParameters[] = $update['warehouse_id'];
+            $keyParameters[] = $update['product_id'];
+        }
+
+        $parameters = array_merge($caseParameters, [$purchaseRequestId], $keyParameters);
+        $statement = $this->db->prepare(
+            'UPDATE purchase_request_items
+             SET received_quantity = CASE ' . implode(' ', $quantityCases) . ' ELSE received_quantity END
+             WHERE purchase_request_id = ? AND (' . implode(' OR ', $keyConditions) . ')'
+        );
+        $statement->execute($parameters);
     }
 
     private function processWaitingOrders(): void
     {
-        $orders = $this->db->query(
-            "SELECT id, warehouse_id FROM warehouse_restock_orders
-             WHERE status = 'WAITING_SUPPLIER' ORDER BY created_at, id FOR UPDATE"
-        )->fetchAll();
-        foreach ($orders as $order) {
-            $items = $this->restockItems($order['id']);
-            $available = true;
-            foreach ($items as $item) {
-                $stock = $this->lockStock($order['warehouse_id'], $item['product_id']);
-                if ((int) $stock['quantity'] - (int) $stock['reserved'] < (int) $item['quantity']) {
-                    $available = false;
+        $ownsTransaction = !$this->db->inTransaction();
+        if ($ownsTransaction) {
+            $this->db->beginTransaction();
+        }
+
+        try {
+            $orders = $this->db->query(
+                "SELECT id, warehouse_id, retail_id FROM warehouse_restock_orders
+                 WHERE status = 'WAITING_SUPPLIER' ORDER BY created_at, id FOR UPDATE"
+            )->fetchAll();
+            $itemsByOrder = [];
+            $stockRows = [];
+            if ($orders !== []) {
+                $orderIds = array_column($orders, 'id');
+                $placeholders = \implode(',', \array_fill(0, \count($orderIds), '?'));
+                $itemsStatement = $this->db->prepare(
+                    "SELECT restock_order_id, product_id, quantity
+                     FROM warehouse_restock_order_items
+                     WHERE restock_order_id IN ({$placeholders})
+                     ORDER BY restock_order_id, product_id"
+                );
+                $itemsStatement->execute($orderIds);
+                $warehouseByOrder = array_column($orders, 'warehouse_id', 'id');
+                foreach ($itemsStatement->fetchAll() as $item) {
+                    $itemsByOrder[$item['restock_order_id']][] = $item;
+                    $stockRows[] = [
+                        'warehouse_id' => $warehouseByOrder[$item['restock_order_id']],
+                        'product_id' => $item['product_id'],
+                    ];
                 }
             }
-            if (!$available) {
-                continue;
+            $stockRows = $this->uniqueStockRows($stockRows);
+            $this->insertStockRows($stockRows);
+
+            $stockConditions = [];
+            $stockParameters = [];
+            foreach ($stockRows as $stockRow) {
+                $stockConditions[] = '(warehouse_id = ? AND product_id = ?)';
+                $stockParameters[] = $stockRow['warehouse_id'];
+                $stockParameters[] = $stockRow['product_id'];
             }
-            foreach ($items as $item) {
-                $stock = $this->lockStock($order['warehouse_id'], $item['product_id']);
-                $reserved = (int) $stock['reserved'] + (int) $item['quantity'];
-                $this->setReserved($order['warehouse_id'], $item['product_id'], $reserved);
-                $this->movement(
-                    $order['warehouse_id'], $item['product_id'], 'RESERVE', (int) $item['quantity'],
-                    'RESTOCK_ORDER', $order['id'], (int) $stock['quantity'], (int) $stock['quantity'],
-                    (int) $stock['reserved'], $reserved
+            $stocksByKey = [];
+            if ($stockConditions !== []) {
+                $stockStatement = $this->db->prepare(
+                    'SELECT warehouse_id, product_id, quantity, reserved, min_stock, updated_at
+                     FROM warehouse_stocks WHERE ' . implode(' OR ', $stockConditions) . '
+                     ORDER BY warehouse_id, product_id'
                 );
+                $stockStatement->execute($stockParameters);
+                foreach ($stockStatement->fetchAll() as $stock) {
+                    $stocksByKey[$this->stockKey($stock['warehouse_id'], $stock['product_id'])] = $stock;
+                }
             }
-            $this->db->prepare("UPDATE warehouse_restock_orders SET status = 'RESERVED' WHERE id = ?")
-                ->execute([$order['id']]);
-            $this->addOutbox('shipment.requested', $this->shipmentPayload($order['id']));
+
+            $reservedOrderIds = [];
+            $reservedUpdates = [];
+            $movements = [];
+            $outboxEvents = [];
+            foreach ($orders as $order) {
+                $items = $itemsByOrder[$order['id']] ?? [];
+                $available = true;
+                foreach ($items as $item) {
+                    $stock = $stocksByKey[$this->stockKey($order['warehouse_id'], $item['product_id'])] ?? null;
+                    if (!$stock) {
+                        throw new ApiException(409, 'Stock row could not be initialized');
+                    }
+                    if ((int) $stock['quantity'] - (int) $stock['reserved'] < (int) $item['quantity']) {
+                        $available = false;
+                    }
+                }
+                if (!$available) {
+                    continue;
+                }
+                foreach ($items as $item) {
+                    $key = $this->stockKey($order['warehouse_id'], $item['product_id']);
+                    $stock = $stocksByKey[$key];
+                    $reserved = (int) $stock['reserved'] + (int) $item['quantity'];
+                    $reservedUpdates[$key] = [
+                        'warehouse_id' => $order['warehouse_id'],
+                        'product_id' => $item['product_id'],
+                        'reserved' => $reserved,
+                    ];
+                    $movements[] = [
+                        'warehouse_id' => $order['warehouse_id'],
+                        'product_id' => $item['product_id'],
+                        'movement_type' => 'RESERVE',
+                        'quantity' => (int) $item['quantity'],
+                        'reference_type' => 'RESTOCK_ORDER',
+                        'reference_id' => $order['id'],
+                        'quantity_before' => (int) $stock['quantity'],
+                        'quantity_after' => (int) $stock['quantity'],
+                        'reserved_before' => (int) $stock['reserved'],
+                        'reserved_after' => $reserved,
+                    ];
+                    $stocksByKey[$key]['reserved'] = $reserved;
+                }
+                $reservedOrderIds[] = $order['id'];
+                $outboxEvents[] = [
+                    'event_type' => 'shipment.requested',
+                    'payload' => [
+                        'restock_order_id' => $order['id'],
+                        'warehouse_id' => $order['warehouse_id'],
+                        'retail_id' => $order['retail_id'],
+                        'items' => array_map(
+                            static fn(array $item): array => [
+                                'product_id' => $item['product_id'],
+                                'quantity' => (int) $item['quantity'],
+                            ],
+                            $items
+                        ),
+                    ],
+                ];
+            }
+            $this->updateReservedStocks(array_values($reservedUpdates));
+            $this->insertMovements($movements);
+            $this->insertOutboxEvents($outboxEvents);
+
+            if ($reservedOrderIds !== []) {
+                $placeholders = \implode(',', \array_fill(0, \count($reservedOrderIds), '?'));
+                $this->db->prepare(
+                    "UPDATE warehouse_restock_orders SET status = 'RESERVED'
+                     WHERE status = 'WAITING_SUPPLIER' AND id IN ({$placeholders})"
+                )->execute($reservedOrderIds);
+            }
+
+            if ($ownsTransaction) {
+                $this->db->commit();
+            }
+        } catch (Throwable $exception) {
+            if ($ownsTransaction && $this->db->inTransaction()) {
+                $this->db->rollBack();
+            }
+            throw $exception;
         }
     }
 
@@ -475,36 +840,161 @@ public function listStocks(array $filters): array
         }
     }
 
-    private function lockStock(string $warehouseId, string $productId): array
+    private function assertActiveWarehouses(array $ids): void
     {
-        $insert = $this->db->prepare(
-            'INSERT INTO warehouse_stocks (warehouse_id, product_id, quantity, reserved, min_stock)
-             VALUES (?, ?, 0, 0, 0) ON DUPLICATE KEY UPDATE product_id = VALUES(product_id)'
-        );
-        $insert->execute([$warehouseId, $productId]);
+        $ids = array_values(array_unique($ids));
+        if ($ids === []) {
+            return;
+        }
+
+        $placeholders = \implode(',', \array_fill(0, \count($ids), '?'));
         $statement = $this->db->prepare(
-            'SELECT * FROM warehouse_stocks WHERE warehouse_id = ? AND product_id = ? FOR UPDATE'
+            "SELECT id, is_active FROM warehouses WHERE id IN ({$placeholders})"
         );
-        $statement->execute([$warehouseId, $productId]);
-        return $statement->fetch();
+        $statement->execute($ids);
+        $warehousesById = [];
+        foreach ($statement->fetchAll() as $warehouse) {
+            $warehousesById[$warehouse['id']] = (bool) $warehouse['is_active'];
+        }
+        foreach ($ids as $id) {
+            if (!\array_key_exists($id, $warehousesById)) {
+                throw new ApiException(404, 'Warehouse not found');
+            }
+            if (!$warehousesById[$id]) {
+                throw new ApiException(409, 'Warehouse is inactive');
+            }
+        }
+    }
+
+    private function insertStockRows(array $stockRows): void
+    {
+        $uniqueRows = $this->uniqueStockRows($stockRows);
+        if ($uniqueRows === []) {
+            return;
+        }
+
+        $placeholders = [];
+        $parameters = [];
+        foreach ($uniqueRows as $row) {
+            $placeholders[] = '(?, ?, 0, 0, 0)';
+            $parameters[] = $row['warehouse_id'];
+            $parameters[] = $row['product_id'];
+        }
+        $statement = $this->db->prepare(
+            'INSERT INTO warehouse_stocks (warehouse_id, product_id, quantity, reserved, min_stock)
+             VALUES ' . implode(', ', $placeholders) . '
+             ON DUPLICATE KEY UPDATE product_id = VALUES(product_id)'
+        );
+        // The upsert takes InnoDB row locks until the enclosing transaction completes.
+        $statement->execute($parameters);
+    }
+
+    private function uniqueStockRows(array $stockRows): array
+    {
+        $uniqueRows = [];
+        foreach ($stockRows as $row) {
+            $uniqueRows[$this->stockKey($row['warehouse_id'], $row['product_id'])] = $row;
+        }
+        return array_values($uniqueRows);
+    }
+
+    private function stockKey(string $warehouseId, string $productId): string
+    {
+        return $warehouseId . "\0" . $productId;
+    }
+
+    private function updateReservedStocks(array $updates): void
+    {
+        if ($updates === []) {
+            return;
+        }
+
+        $cases = [];
+        $conditions = [];
+        $parameters = [];
+        foreach ($updates as $update) {
+            $cases[] = 'WHEN warehouse_id = ? AND product_id = ? THEN ?';
+            $parameters[] = $update['warehouse_id'];
+            $parameters[] = $update['product_id'];
+            $parameters[] = $update['reserved'];
+            $conditions[] = '(warehouse_id = ? AND product_id = ?)';
+        }
+        foreach ($updates as $update) {
+            $parameters[] = $update['warehouse_id'];
+            $parameters[] = $update['product_id'];
+        }
+        $statement = $this->db->prepare(
+            'UPDATE warehouse_stocks
+             SET reserved = CASE ' . implode(' ', $cases) . ' ELSE reserved END
+             WHERE ' . implode(' OR ', $conditions)
+        );
+        $statement->execute($parameters);
+    }
+
+    private function insertMovements(array $movements): void
+    {
+        if ($movements === []) {
+            return;
+        }
+
+        $placeholders = [];
+        $parameters = [];
+        foreach ($movements as $movement) {
+            $placeholders[] = '(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)';
+            $parameters[] = $this->uuid();
+            $parameters[] = $movement['warehouse_id'];
+            $parameters[] = $movement['product_id'];
+            $parameters[] = $movement['movement_type'];
+            $parameters[] = $movement['quantity'];
+            $parameters[] = $movement['reference_type'];
+            $parameters[] = $movement['reference_id'];
+            $parameters[] = $movement['quantity_before'];
+            $parameters[] = $movement['quantity_after'];
+            $parameters[] = $movement['reserved_before'];
+            $parameters[] = $movement['reserved_after'];
+        }
+        $statement = $this->db->prepare(
+            'INSERT INTO stock_movements
+             (id, warehouse_id, product_id, movement_type, quantity, reference_type, reference_id,
+              quantity_before, quantity_after, reserved_before, reserved_after)
+             VALUES ' . implode(', ', $placeholders)
+        );
+        $statement->execute($parameters);
+    }
+
+    private function insertOutboxEvents(array $events): void
+    {
+        if ($events === []) {
+            return;
+        }
+
+        $placeholders = [];
+        $parameters = [];
+        foreach ($events as $event) {
+            $placeholders[] = '(?, ?, ?)';
+            $parameters[] = $this->uuid();
+            $parameters[] = $event['event_type'];
+            $parameters[] = json_encode(
+                $event['payload'],
+                JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR
+            );
+        }
+        $statement = $this->db->prepare(
+            'INSERT INTO outbox_events (id, event_type, payload) VALUES ' . implode(', ', $placeholders)
+        );
+        $statement->execute($parameters);
     }
 
     private function stockRow(string $warehouseId, string $productId): array
     {
         $statement = $this->db->prepare(
-            'SELECT *, quantity - reserved AS available FROM warehouse_stocks
+            'SELECT warehouse_id, product_id, quantity, reserved, min_stock, updated_at,
+                    quantity - reserved AS available
+             FROM warehouse_stocks
              WHERE warehouse_id = ? AND product_id = ?'
         );
         $statement->execute([$warehouseId, $productId]);
         return $statement->fetch();
-    }
-
-    private function setReserved(string $warehouseId, string $productId, int $reserved): void
-    {
-        $statement = $this->db->prepare(
-            'UPDATE warehouse_stocks SET reserved = ? WHERE warehouse_id = ? AND product_id = ?'
-        );
-        $statement->execute([$reserved, $warehouseId, $productId]);
     }
 
     private function movement(
@@ -544,7 +1034,10 @@ public function listStocks(array $filters): array
 
     private function restockOrder(string $id): array
     {
-        $statement = $this->db->prepare('SELECT * FROM warehouse_restock_orders WHERE id = ?');
+        $statement = $this->db->prepare(
+            'SELECT id, warehouse_id, retail_id, status, rejection_reason, created_at, updated_at
+             FROM warehouse_restock_orders WHERE id = ?'
+        );
         $statement->execute([$id]);
         $order = $statement->fetch() ?: throw new ApiException(404, 'Restock order not found');
         $order['items'] = $this->restockItems($id);
@@ -554,79 +1047,42 @@ public function listStocks(array $filters): array
     private function restockItems(string $id): array
     {
         $statement = $this->db->prepare(
-            'SELECT * FROM warehouse_restock_order_items WHERE restock_order_id = ? ORDER BY product_id'
+            'SELECT restock_order_id, product_id, quantity
+             FROM warehouse_restock_order_items WHERE restock_order_id = ? ORDER BY product_id'
         );
         $statement->execute([$id]);
         return $statement->fetchAll();
     }
 
-    private function lockRestockOrder(string $id): array
-    {
-        $statement = $this->db->prepare('SELECT * FROM warehouse_restock_orders WHERE id = ? FOR UPDATE');
-        $statement->execute([$id]);
-        return $statement->fetch() ?: throw new ApiException(404, 'Restock order not found');
-    }
-
-    private function shipmentPayload(string $id): array
-    {
-        $order = $this->restockOrder($id);
-        return [
-            'restock_order_id' => $order['id'],
-            'warehouse_id' => $order['warehouse_id'],
-            'retail_id' => $order['retail_id'],
-            'items' => array_map(static fn(array $item): array => [
-                'product_id' => $item['product_id'],
-                'quantity' => (int) $item['quantity'],
-            ], $order['items']),
-        ];
-    }
-
     private function purchaseRequest(string $id): array
     {
-        $statement = $this->db->prepare('SELECT * FROM purchase_requests WHERE id = ?');
+        $statement = $this->db->prepare(
+            'SELECT id, po_id, supplier_id, status, created_at, updated_at
+             FROM purchase_requests WHERE id = ?'
+        );
         $statement->execute([$id]);
         $request = $statement->fetch() ?: throw new ApiException(404, 'Purchase request not found');
         $items = $this->db->prepare(
-            'SELECT * FROM purchase_request_items WHERE purchase_request_id = ? ORDER BY warehouse_id, product_id'
+            'SELECT purchase_request_id, warehouse_id, product_id, quantity, received_quantity
+             FROM purchase_request_items
+             WHERE purchase_request_id = ? ORDER BY warehouse_id, product_id'
         );
         $items->execute([$id]);
         $request['items'] = $items->fetchAll();
         return $request;
     }
 
-    private function lockPurchaseRequest(string $poId): array
-    {
-        $statement = $this->db->prepare(
-            'SELECT * FROM purchase_requests WHERE po_id = ? OR id = ? LIMIT 1 FOR UPDATE'
-        );
-        $statement->execute([$poId, $poId]);
-        return $statement->fetch() ?: throw new ApiException(404, 'Purchase order not found');
-    }
-
-    private function lockPurchaseItem(string $purchaseId, string $productId, ?string $warehouseId): array
-    {
-        $sql = 'SELECT * FROM purchase_request_items WHERE purchase_request_id = ? AND product_id = ?';
-        $values = [$purchaseId, $productId];
-        if ($warehouseId !== null) {
-            $sql .= ' AND warehouse_id = ?';
-            $values[] = $warehouseId;
-        }
-        $sql .= ' FOR UPDATE';
-        $statement = $this->db->prepare($sql);
-        $statement->execute($values);
-        $rows = $statement->fetchAll();
-        if (\count($rows) !== 1) {
-            throw new ApiException(422, 'Receipt item must match exactly one PO line; include warehouse_id if needed');
-        }
-        return $rows[0];
-    }
-
     private function goodsReceipt(string $id): array
     {
-        $statement = $this->db->prepare('SELECT * FROM goods_receipts WHERE id = ?');
+        $statement = $this->db->prepare(
+            'SELECT id, purchase_request_id, created_at FROM goods_receipts WHERE id = ?'
+        );
         $statement->execute([$id]);
-        $receipt = $statement->fetch();
-        $items = $this->db->prepare('SELECT * FROM goods_receipt_items WHERE goods_receipt_id = ?');
+        $receipt = $statement->fetch() ?: throw new ApiException(404, 'Goods receipt not found');
+        $items = $this->db->prepare(
+            'SELECT id, goods_receipt_id, warehouse_id, product_id, quantity
+             FROM goods_receipt_items WHERE goods_receipt_id = ?'
+        );
         $items->execute([$id]);
         $receipt['items'] = $items->fetchAll();
         return $receipt;

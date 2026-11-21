@@ -25,6 +25,17 @@ try {
     }
     $path = preg_replace('#/index\.php(?=/|$)#', '', $path) ?: '/';
     $path = rtrim($path, '/') ?: '/';
+    if ($method === 'GET' && $path === '/') {
+        $dashboard = file_get_contents(__DIR__ . '/dashboard.html');
+        if ($dashboard === false) {
+            throw new RuntimeException('Unable to load warehouse dashboard');
+        }
+        header('Content-Type: text/html; charset=utf-8');
+        header('Cache-Control: no-store');
+        echo $dashboard;
+        exit;
+    }
+
     $body = in_array($method, ['POST', 'PUT', 'PATCH'], true) ? Http::jsonBody() : [];
     $db = Database::connection();
     $warehouse = new WarehouseService($db);
